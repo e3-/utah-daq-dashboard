@@ -42,108 +42,133 @@ def get_eia_generation_mix():
     if not EIA_API_KEY:
         return pd.DataFrame()
 
-    series_map = {
-        "Coal": "ELEC.GEN.COW-UT-99.M",
-        "Natural gas": "ELEC.GEN.NG-UT-99.M",
-        "Solar": "ELEC.GEN.SUN-UT-99.M",
-        "Wind": "ELEC.GEN.WND-UT-99.M",
-        "Hydro": "ELEC.GEN.HYC-UT-99.M",
-        "Petroleum": "ELEC.GEN.PEL-UT-99.M",
-        "Other": "ELEC.GEN.OTH-UT-99.M",
+    url = "https://api.eia.gov/v2/electricity/electricity-power-operational-data/data/"
+
+    params = {
+        "api_key": EIA_API_KEY,
+        "frequency": "monthly",
+        "data[0]": "generation",
+        "facets[stateid][]": "UT",
+        "facets[sectorid][]": "99",
+        "start": "2023-01",
+        "sort[0][column]": "period",
+        "sort[0][direction]": "asc",
+        "offset": 0,
+        "length": 5000,
     }
 
-    all_rows = []
+    try:
+        r = requests.get(url, params=params, timeout=30)
 
-    for resource, series_id in series_map.items():
-        url = f"https://api.eia.gov/v2/seriesid/{series_id}"
+        if r.status_code != 200:
+            st.caption(f"EIA status code: {r.status_code}")
+            return pd.DataFrame()
 
-        try:
-            r = requests.get(
-                url,
-                params={"api_key": EIA_API_KEY},
-                timeout=30,
-            )
+        rows = r.json().get("response", {}).get("data", [])
+        df = pd.DataFrame(rows)
 
-            if r.status_code != 200:
-                continue
+        if df.empty:
+            return pd.DataFrame()
 
-            data = r.json().get("response", {}).get("data", [])
+        df["generation"] = pd.to_numeric(df["generation"], errors="coerce")
+        df["period"] = pd.to_datetime(df["period"], errors="coerce")
 
-            for row in data:
-                all_rows.append(
-                    {
-                        "period": row.get("period"),
-                        "Resource": resource,
-                        "generation": row.get("value"),
-                    }
-                )
+        fuel_col = None
+        for col in ["fueltypeid", "fueltype", "fuelTypeId"]:
+            if col in df.columns:
+                fuel_col = col
+                break
 
-        except Exception:
-            continue
+        fuel_name_col = None
+        for col in ["fuelTypeDescription", "fueltypeDescription", "fueltype"]:
+            if col in df.columns:
+                fuel_name_col = col
+                break
 
-    df = pd.DataFrame(all_rows)
+        fuel_map = {
+            "COL": "Coal",
+            "NG": "Natural gas",
+            "SUN": "Solar",
+            "WND": "Wind",
+            "HYC": "Hydro",
+            "NUC": "Nuclear",
+            "PEL": "Petroleum",
+            "OTH": "Other",
+            "OOG": "Other",
+        }
 
-    if df.empty:
+        if fuel_col:
+            df["Resource"] = df[fuel_col].astype(str).str.upper().map(fuel_map)
+
+        if "Resource" not in df.columns or df["Resource"].isna().all():
+            if fuel_name_col:
+                df["Resource"] = df[fuel_name_col].astype(str).str.title()
+            else:
+                return pd.DataFrame()
+
+        df["Resource"] = df["Resource"].fillna("Other")
+
+        monthly = (
+            df.dropna(subset=["period", "generation"])
+            .groupby(["period", "Resource"], as_index=False)["generation"]
+            .sum()
+        )
+
+        monthly["Total"] = monthly.groupby("period")["generation"].transform("sum")
+        monthly = monthly[monthly["Total"] > 0]
+        monthly["Share"] = monthly["generation"] / monthly["Total"] * 100
+
+        return monthly.sort_values("period")
+
+    except Exception as e:
+        st.caption(f"EIA connection note: {e}")
         return pd.DataFrame()
-
-    df["generation"] = pd.to_numeric(df["generation"], errors="coerce")
-    df["period"] = pd.to_datetime(df["period"], errors="coerce")
-    df = df.dropna(subset=["period", "generation"])
-
-    monthly = (
-        df.groupby(["period", "Resource"], as_index=False)["generation"]
-        .sum()
-    )
-
-    monthly["Total"] = monthly.groupby("period")["generation"].transform("sum")
-    monthly = monthly[monthly["Total"] > 0]
-    monthly["Share"] = monthly["generation"] / monthly["Total"] * 100
-
-    return monthly.sort_values("period")
 
 
 @st.cache_data(ttl=60 * 60 * 12)
 def get_ev_registration_share():
     try:
-        xl = pd.ExcelFile(UTAH_REGISTRATION_2026)
+        df = pd.read_excel(
+            UTAH_REGISTRATION_2026,
+            sheet_name="Table 6",
+            header=None
+        )
     except Exception:
         return None, None
 
-    dfs = []
+    data = df.iloc[6:].copy()
 
-    for sheet in xl.sheet_names:
-        try:
-            temp = pd.read_excel(xl, sheet_name=sheet)
-            dfs.append(temp)
-        except Exception:
-            pass
+    vehicle_type_col = 1
+    electric_col = 6
+    plug_in_hybrid_col = 12
+    total_col = 15
 
-    if not dfs:
-        return None, None
+    data[vehicle_type_col] = data[vehicle_type_col].astype(str).str.strip()
 
-    df = pd.concat(dfs, ignore_index=True)
-    df.columns = [str(c).lower() for c in df.columns]
+    ldv = data[
+        data[vehicle_type_col].isin(
+            ["Passenger - Standard", "Light Truck"]
+        )
+    ].copy()
 
-    text_cols = df.select_dtypes(include="object").columns
-    num_cols = df.select_dtypes(include="number").columns
-
-    if len(text_cols) == 0 or len(num_cols) == 0:
-        return None, None
-
-    combined = df[text_cols].astype(str).agg(" ".join, axis=1).str.lower()
-
-    ev_mask = combined.str.contains("electric|bev|phev", na=False)
-    ldv_mask = combined.str.contains("car|truck|suv|passenger", na=False)
-
-    count_col = num_cols[-1]
-
-    total = df.loc[ldv_mask, count_col].sum()
-    ev = df.loc[ev_mask & ldv_mask, count_col].sum()
+    electric = pd.to_numeric(ldv[electric_col], errors="coerce").fillna(0).sum()
+    plug_in_hybrid = (
+        pd.to_numeric(ldv[plug_in_hybrid_col], errors="coerce").fillna(0).sum()
+    )
+    total = pd.to_numeric(ldv[total_col], errors="coerce").fillna(0).sum()
 
     if total == 0:
         return None, None
 
-    return ev / total * 100, "estimated from workbook"
+    share = (electric + plug_in_hybrid) / total * 100
+
+    note = (
+        "Utah Tax Commission 2026 registrations, Table 6. "
+        "Light-duty proxy includes Passenger - Standard and Light Truck. "
+        "ZEV proxy includes Electric and Plug-in Hybrid."
+    )
+
+    return share, note
 
 
 @st.cache_data(ttl=60 * 60 * 12)
@@ -163,10 +188,10 @@ def get_gsl_elevation():
     series = r.json()["value"]["timeSeries"][0]["values"][0]["value"]
 
     df = pd.DataFrame(series)
-    df["date"] = pd.to_datetime(df["dateTime"])
+    df["date"] = pd.to_datetime(df["dateTime"], errors="coerce")
     df["elevation_ft"] = pd.to_numeric(df["value"], errors="coerce")
 
-    return df.dropna()
+    return df.dropna(subset=["date", "elevation_ft"])
 
 
 st.title("Beehive Emissions Reduction Plan Dashboard")
@@ -192,7 +217,7 @@ else:
     latest_month = gen["period"].max()
     latest = gen[gen["period"] == latest_month]
 
-    zero_emissions_resources = ["Solar", "Wind", "Hydro"]
+    zero_emissions_resources = ["Solar", "Wind", "Hydro", "Nuclear"]
     fossil_resources = ["Coal", "Natural gas", "Petroleum"]
 
     zero_emissions_share = latest.loc[
@@ -266,8 +291,8 @@ st.write(
 ev, note = get_ev_registration_share()
 
 if ev is not None:
-    st.metric("Estimated EV registration share", f"{ev:.2f}%")
-    st.caption(f"Calculation note: {note}")
+    st.metric("EV share of light-duty registrations", f"{ev:.2f}%")
+    st.caption(note)
 else:
     st.info(
         "EV registration share is under development. Once finalized, this section will "
