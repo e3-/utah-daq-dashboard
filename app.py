@@ -42,67 +42,56 @@ def get_eia_generation_mix():
     if not EIA_API_KEY:
         return pd.DataFrame()
 
-    url = "https://api.eia.gov/v2/electricity/electric-power-operational-data/data/"
-
-    params = {
-        "api_key": EIA_API_KEY,
-        "frequency": "monthly",
-        "data[0]": "generation",
-        "facets[stateid][]": "UT",
-        "start": "2023-01",
-        "sort[0][column]": "period",
-        "sort[0][direction]": "asc",
-        "offset": 0,
-        "length": 5000,
+    series_map = {
+        "Coal": "ELEC.GEN.COW-UT-99.M",
+        "Natural gas": "ELEC.GEN.NG-UT-99.M",
+        "Solar": "ELEC.GEN.SUN-UT-99.M",
+        "Wind": "ELEC.GEN.WND-UT-99.M",
+        "Hydro": "ELEC.GEN.HYC-UT-99.M",
+        "Petroleum": "ELEC.GEN.PEL-UT-99.M",
+        "Other": "ELEC.GEN.OTH-UT-99.M",
     }
 
-    r = requests.get(url, params=params, timeout=30)
+    all_rows = []
 
-    # SAFE ERROR HANDLING (fixes your crash)
-    if r.status_code != 200:
-        st.warning(
-            "EIA generation data did not load. This is usually caused by an invalid API key, "
-            "a Streamlit secrets formatting issue, or an EIA API endpoint change."
-        )
-        st.caption(f"EIA status code: {r.status_code}")
-        return pd.DataFrame()
+    for resource, series_id in series_map.items():
+        url = f"https://api.eia.gov/v2/seriesid/{series_id}"
 
-    rows = r.json().get("response", {}).get("data", [])
-    df = pd.DataFrame(rows)
+        try:
+            r = requests.get(
+                url,
+                params={"api_key": EIA_API_KEY},
+                timeout=30,
+            )
+
+            if r.status_code != 200:
+                continue
+
+            data = r.json().get("response", {}).get("data", [])
+
+            for row in data:
+                all_rows.append(
+                    {
+                        "period": row.get("period"),
+                        "Resource": resource,
+                        "generation": row.get("value"),
+                    }
+                )
+
+        except Exception:
+            continue
+
+    df = pd.DataFrame(all_rows)
 
     if df.empty:
-        return df
-
-    df.columns = [str(c).strip() for c in df.columns]
-
-    fuel_col = None
-    for col in ["fueltype", "fueltypeid", "fueltypeDescription"]:
-        if col in df.columns:
-            fuel_col = col
-            break
-
-    if fuel_col is None:
         return pd.DataFrame()
 
     df["generation"] = pd.to_numeric(df["generation"], errors="coerce")
     df["period"] = pd.to_datetime(df["period"], errors="coerce")
-
-    fuel_map = {
-        "COL": "Coal",
-        "NG": "Natural gas",
-        "SUN": "Solar",
-        "WND": "Wind",
-        "HYC": "Hydro",
-        "NUC": "Nuclear",
-        "PEL": "Petroleum",
-        "OTH": "Other",
-    }
-
-    df["Resource"] = df[fuel_col].map(fuel_map).fillna(df[fuel_col])
+    df = df.dropna(subset=["period", "generation"])
 
     monthly = (
-        df.dropna(subset=["period", "generation"])
-        .groupby(["period", "Resource"], as_index=False)["generation"]
+        df.groupby(["period", "Resource"], as_index=False)["generation"]
         .sum()
     )
 
@@ -110,7 +99,7 @@ def get_eia_generation_mix():
     monthly = monthly[monthly["Total"] > 0]
     monthly["Share"] = monthly["generation"] / monthly["Total"] * 100
 
-    return monthly
+    return monthly.sort_values("period")
 
 
 @st.cache_data(ttl=60 * 60 * 12)
@@ -121,6 +110,7 @@ def get_ev_registration_share():
         return None, None
 
     dfs = []
+
     for sheet in xl.sheet_names:
         try:
             temp = pd.read_excel(xl, sheet_name=sheet)
@@ -179,13 +169,12 @@ def get_gsl_elevation():
     return df.dropna()
 
 
-# ===========================
-# DASHBOARD
-# ===========================
-
 st.title("Beehive Emissions Reduction Plan Dashboard")
+st.caption(
+    "Prototype dashboard for discussion purposes. Data sources are live where available; "
+    "some metrics are illustrative or under development."
+)
 
-# -------- ELECTRIC GENERATION --------
 st.header("Electric Generation")
 st.write(
     "BERP identified increasing zero emissions generation as a crucial strategy "
@@ -195,12 +184,44 @@ st.write(
 gen = get_eia_generation_mix()
 
 if gen.empty:
-    st.warning("EIA data unavailable. Check API key.")
+    st.info(
+        "Electric generation data connection is under development. Once connected, "
+        "this section will display Utah's monthly generation mix by resource."
+    )
 else:
-    fig = px.area(gen, x="period", y="Share", color="Resource")
-    st.plotly_chart(fig, use_container_width=True)
+    latest_month = gen["period"].max()
+    latest = gen[gen["period"] == latest_month]
 
-# -------- WORKING LANDS --------
+    zero_emissions_resources = ["Solar", "Wind", "Hydro"]
+    fossil_resources = ["Coal", "Natural gas", "Petroleum"]
+
+    zero_emissions_share = latest.loc[
+        latest["Resource"].isin(zero_emissions_resources), "Share"
+    ].sum()
+
+    fossil_share = latest.loc[
+        latest["Resource"].isin(fossil_resources), "Share"
+    ].sum()
+
+    col1, col2 = st.columns(2)
+    col1.metric("Zero-emissions generation share", f"{zero_emissions_share:.1f}%")
+    col2.metric("Fossil generation share", f"{fossil_share:.1f}%")
+
+    fig = px.area(
+        gen,
+        x="period",
+        y="Share",
+        color="Resource",
+        labels={
+            "period": "Month",
+            "Share": "Share of generation (%)",
+            "Resource": "Resource",
+        },
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"EIA latest month loaded: {latest_month.strftime('%B %Y')}")
+
 st.header("Working Lands")
 st.write(
     "BERP identified maintaining inflows to the Great Salt Lake as a critical "
@@ -208,11 +229,34 @@ st.write(
     "sequestration in the lakebed."
 )
 
-gsl = get_gsl_elevation()
-fig = px.line(gsl, x="date", y="elevation_ft")
-st.plotly_chart(fig, use_container_width=True)
+try:
+    gsl = get_gsl_elevation()
 
-# -------- TRANSPORTATION --------
+    fig = px.line(
+        gsl,
+        x="date",
+        y="elevation_ft",
+        labels={
+            "date": "Date",
+            "elevation_ft": "Elevation, feet above NGVD 1929",
+        },
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        f"Latest Great Salt Lake elevation loaded: "
+        f"{gsl['elevation_ft'].iloc[-1]:,.2f} feet on "
+        f"{gsl['date'].iloc[-1].strftime('%B %d, %Y')}. "
+        "Source: USGS station 10010000."
+    )
+
+except Exception:
+    st.info(
+        "Great Salt Lake elevation data connection is under development. Once connected, "
+        "this section will display recent lake elevation trends."
+    )
+
 st.header("Transportation")
 st.write(
     "BERP identified increasing adoption of Zero Emissions Vehicles as a crucial "
@@ -221,24 +265,54 @@ st.write(
 
 ev, note = get_ev_registration_share()
 
-if ev:
-    st.metric("EV Share", f"{ev:.2f}%")
+if ev is not None:
+    st.metric("Estimated EV registration share", f"{ev:.2f}%")
+    st.caption(f"Calculation note: {note}")
 else:
-    st.warning("Could not parse EV share")
+    st.info(
+        "EV registration share is under development. Once finalized, this section will "
+        "display the share of Utah light-duty vehicle registrations that are zero-emission vehicles."
+    )
 
-# -------- PROGRAMS --------
 st.header("Program Updates")
 
 c1, c2, c3 = st.columns(3)
 
 with c1:
-    st.info("Charge Your Yard: XXX units removed, XXX emissions reduced")
+    st.info(
+        "**Charge Your Yard**\n\n"
+        "The Charge Your Yard program has removed **XXX fuel-based equipment units** "
+        "from use, reducing air quality emissions by **XXX per year**. Program staff "
+        "are continuing to track equipment retirements, rebate participation, and "
+        "estimated emissions benefits."
+    )
 
 with c2:
-    st.success("Industrial efficiency improvements underway across sectors")
+    st.success(
+        "**Industrial Efficiency Improvements**\n\n"
+        "DAQ-supported industrial efficiency improvements are helping facilities reduce "
+        "fuel use, improve process controls, and lower emissions intensity. Recent "
+        "activities include identifying high-priority equipment upgrades, evaluating "
+        "cost-effective efficiency opportunities, and coordinating with facility staff "
+        "on implementation timelines."
+    )
 
 with c3:
     st.warning(
-        "Utah Renewable Communities approved and under implementation. "
-        "Participants: " + ", ".join(PARTICIPATING_COMMUNITIES)
+        "**Utah Renewable Communities**\n\n"
+        "The Utah Renewable Communities program has received regulatory approval and "
+        "is now moving into implementation. Participating communities include:\n\n"
+        + ", ".join(PARTICIPATING_COMMUNITIES)
+        + ".\n\n"
+        "Together, these communities represent **XX% of statewide electricity demand**. "
+        "This placeholder should be replaced once the final demand-share calculation "
+        "has been reviewed."
     )
+
+st.divider()
+
+st.caption(
+    "Sources: EIA electricity data for generation mix; Utah State Tax Commission "
+    "vehicle registration workbook for registration data; USGS daily values service "
+    "for Great Salt Lake elevation."
+)
