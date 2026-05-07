@@ -4,13 +4,15 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="Utah DAQ Energy Dashboard",
+    page_title="Beehive Emissions Reduction Plan Dashboard",
     layout="wide"
 )
 
 EIA_API_KEY = st.secrets.get("EIA_API_KEY", "")
 
-UTAH_REGISTRATION_2026 = "https://files.tax.utah.gov/tax/esu/mv-registration/2026registrations.xlsx"
+UTAH_REGISTRATION_2026 = (
+    "https://files.tax.utah.gov/tax/esu/mv-registration/2026registrations.xlsx"
+)
 
 PARTICIPATING_COMMUNITIES = [
     "Town of Alta",
@@ -57,35 +59,63 @@ def get_eia_generation_mix():
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
 
-    rows = r.json()["response"]["data"]
+    rows = r.json().get("response", {}).get("data", [])
     df = pd.DataFrame(rows)
 
     if df.empty:
         return df
 
+    df.columns = [str(c).strip() for c in df.columns]
+
+    fuel_col = None
+    for possible_col in [
+        "fueltype",
+        "fueltypeid",
+        "fuelType",
+        "fuelTypeId",
+        "fueltypeDescription",
+        "fuelTypeDescription",
+    ]:
+        if possible_col in df.columns:
+            fuel_col = possible_col
+            break
+
+    if fuel_col is None or "generation" not in df.columns or "period" not in df.columns:
+        return pd.DataFrame()
+
     df["generation"] = pd.to_numeric(df["generation"], errors="coerce")
-    df["period"] = pd.to_datetime(df["period"])
+    df["period"] = pd.to_datetime(df["period"], errors="coerce")
 
     fuel_map = {
         "COL": "Coal",
         "NG": "Natural gas",
+        "NGO": "Natural gas",
         "SUN": "Solar",
         "WND": "Wind",
         "HYC": "Hydro",
+        "WAT": "Hydro",
         "NUC": "Nuclear",
         "PEL": "Petroleum",
+        "PC": "Petroleum",
         "OOG": "Other",
         "OTH": "Other",
     }
 
-    df["Resource"] = df["fueltype"].map(fuel_map).fillna(df["fueltype"])
+    df["Resource"] = df[fuel_col].astype(str).str.upper().map(fuel_map)
+
+    if df["Resource"].isna().all():
+        df["Resource"] = df[fuel_col].astype(str).str.title()
+    else:
+        df["Resource"] = df["Resource"].fillna(df[fuel_col].astype(str).str.title())
 
     monthly = (
-        df.groupby(["period", "Resource"], as_index=False)["generation"]
+        df.dropna(subset=["period", "generation"])
+        .groupby(["period", "Resource"], as_index=False)["generation"]
         .sum()
     )
 
     monthly["Total"] = monthly.groupby("period")["generation"].transform("sum")
+    monthly = monthly[monthly["Total"] > 0]
     monthly["Share"] = monthly["generation"] / monthly["Total"] * 100
     monthly["Month"] = monthly["period"].dt.strftime("%b %Y")
 
@@ -126,13 +156,13 @@ def get_ev_registration_share():
     ev_mask = combined_text.str.contains(
         r"electric|battery electric|plug.?in|phev|bev",
         regex=True,
-        na=False
+        na=False,
     )
 
     ldv_mask = combined_text.str.contains(
         r"passenger|auto|car|truck|light|suv",
         regex=True,
-        na=False
+        na=False,
     )
 
     count_col = number_cols[-1]
@@ -167,28 +197,42 @@ def get_gsl_elevation():
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
 
-    series = r.json()["value"]["timeSeries"][0]["values"][0]["value"]
+    payload = r.json()
+    series = payload["value"]["timeSeries"][0]["values"][0]["value"]
 
     df = pd.DataFrame(series)
-    df["date"] = pd.to_datetime(df["dateTime"])
+
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["dateTime"], errors="coerce")
     df["elevation_ft"] = pd.to_numeric(df["value"], errors="coerce")
 
     return df[["date", "elevation_ft"]].dropna()
 
 
-st.title("Utah DAQ Energy & Air Quality Dashboard")
+st.title("Beehive Emissions Reduction Plan Dashboard")
 st.caption("Internal prototype using live public data where available")
 
 gen = get_eia_generation_mix()
 ev_share, ev_note = get_ev_registration_share()
 
+st.header("Electric Generation")
+st.write(
+    "BERP identified increasing zero emissions generation as a crucial strategy "
+    "to reducing generation-related emissions."
+)
+
 if gen.empty:
-    st.warning("EIA generation data did not load. Add your EIA_API_KEY in Streamlit secrets.")
+    st.warning(
+        "EIA generation data did not load. Check that your EIA_API_KEY is saved "
+        "in Streamlit secrets."
+    )
 else:
     latest_month = gen["period"].max()
     latest = gen[gen["period"] == latest_month]
 
-    renewable_resources = ["Solar", "Wind", "Hydro"]
+    renewable_resources = ["Solar", "Wind", "Hydro", "Nuclear"]
     fossil_resources = ["Coal", "Natural gas", "Petroleum"]
 
     renewable_share = latest.loc[
@@ -199,78 +243,82 @@ else:
         latest["Resource"].isin(fossil_resources), "Share"
     ].sum()
 
-    solar_share = latest.loc[
-        latest["Resource"].eq("Solar"), "Share"
-    ].sum()
+    solar_share = latest.loc[latest["Resource"].eq("Solar"), "Share"].sum()
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
 
-    col1.metric("Renewable generation share", f"{renewable_share:.1f}%")
+    col1.metric("Zero-emissions generation share", f"{renewable_share:.1f}%")
     col2.metric("Fossil generation share", f"{fossil_share:.1f}%")
     col3.metric("Solar generation share", f"{solar_share:.1f}%")
 
-    if ev_share is not None:
-        col4.metric("EV registration share", f"{ev_share:.2f}%")
-    else:
-        col4.metric("EV registration share", "Needs parsing")
-
-    st.subheader("Monthly Utah Electricity Generation Mix")
-
     fig = px.area(
-        gen,
-        x="Month",
+        gen.sort_values("period"),
+        x="period",
         y="Share",
         color="Resource",
         labels={
+            "period": "Month",
             "Share": "Share of generation (%)",
-            "Month": "Month",
-            "Resource": "Resource"
+            "Resource": "Resource",
         },
     )
 
     st.plotly_chart(fig, use_container_width=True)
     st.caption(f"EIA latest month loaded: {latest_month.strftime('%B %Y')}")
 
-st.subheader("Great Salt Lake Elevation")
+st.header("Working Lands")
+st.write(
+    "BERP identified maintaining inflows to the Great Salt Lake as a critical "
+    "measure as it supports ecosystem health, dust suppression, and carbon "
+    "sequestration in the lakebed."
+)
 
 try:
     gsl = get_gsl_elevation()
 
-    fig_gsl = px.line(
-        gsl,
-        x="date",
-        y="elevation_ft",
-        labels={
-            "date": "Date",
-            "elevation_ft": "Elevation, feet above NGVD 1929"
-        },
-    )
+    if gsl.empty:
+        st.warning("Great Salt Lake elevation data was returned but was empty.")
+    else:
+        fig_gsl = px.line(
+            gsl,
+            x="date",
+            y="elevation_ft",
+            labels={
+                "date": "Date",
+                "elevation_ft": "Elevation, feet above NGVD 1929",
+            },
+        )
 
-    st.plotly_chart(fig_gsl, use_container_width=True)
+        st.plotly_chart(fig_gsl, use_container_width=True)
 
-    st.caption(
-        f"Latest Great Salt Lake elevation loaded: "
-        f"{gsl['elevation_ft'].iloc[-1]:,.2f} feet on "
-        f"{gsl['date'].iloc[-1].strftime('%B %d, %Y')}. "
-        "Source: USGS station 10010000."
-    )
+        st.caption(
+            f"Latest Great Salt Lake elevation loaded: "
+            f"{gsl['elevation_ft'].iloc[-1]:,.2f} feet on "
+            f"{gsl['date'].iloc[-1].strftime('%B %d, %Y')}. "
+            "Source: USGS station 10010000."
+        )
 
 except Exception as e:
     st.warning("Great Salt Lake elevation data could not be loaded.")
     st.caption(str(e))
 
-st.subheader("EV Registration Data")
+st.header("Transportation")
+st.write(
+    "BERP identified increasing adoption of Zero Emissions Vehicles as a crucial "
+    "strategy to reducing transportation-related emissions."
+)
 
 if ev_share is not None:
-    st.success(f"Estimated EV registration share: {ev_share:.2f}% ({ev_note})")
+    st.metric("Estimated EV registration share", f"{ev_share:.2f}%")
+    st.caption(f"Calculation note: {ev_note}")
 else:
     st.warning(
         "The Utah registration workbook loaded, but the app could not confidently "
         "parse LDV electric registration share. We may need to inspect the workbook "
-        "tabs and column names, then hard-code the correct sheet/columns."
+        "tabs and column names, then hard-code the correct sheet and columns."
     )
 
-st.subheader("Program Updates")
+st.header("Program Updates")
 
 charge_yard, industrial, renewable = st.columns(3)
 
