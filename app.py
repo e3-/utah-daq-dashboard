@@ -57,7 +57,15 @@ def get_eia_generation_mix():
     }
 
     r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
+
+    # SAFE ERROR HANDLING (fixes your crash)
+    if r.status_code != 200:
+        st.warning(
+            "EIA generation data did not load. This is usually caused by an invalid API key, "
+            "a Streamlit secrets formatting issue, or an EIA API endpoint change."
+        )
+        st.caption(f"EIA status code: {r.status_code}")
+        return pd.DataFrame()
 
     rows = r.json().get("response", {}).get("data", [])
     df = pd.DataFrame(rows)
@@ -68,19 +76,12 @@ def get_eia_generation_mix():
     df.columns = [str(c).strip() for c in df.columns]
 
     fuel_col = None
-    for possible_col in [
-        "fueltype",
-        "fueltypeid",
-        "fuelType",
-        "fuelTypeId",
-        "fueltypeDescription",
-        "fuelTypeDescription",
-    ]:
-        if possible_col in df.columns:
-            fuel_col = possible_col
+    for col in ["fueltype", "fueltypeid", "fueltypeDescription"]:
+        if col in df.columns:
+            fuel_col = col
             break
 
-    if fuel_col is None or "generation" not in df.columns or "period" not in df.columns:
+    if fuel_col is None:
         return pd.DataFrame()
 
     df["generation"] = pd.to_numeric(df["generation"], errors="coerce")
@@ -89,24 +90,15 @@ def get_eia_generation_mix():
     fuel_map = {
         "COL": "Coal",
         "NG": "Natural gas",
-        "NGO": "Natural gas",
         "SUN": "Solar",
         "WND": "Wind",
         "HYC": "Hydro",
-        "WAT": "Hydro",
         "NUC": "Nuclear",
         "PEL": "Petroleum",
-        "PC": "Petroleum",
-        "OOG": "Other",
         "OTH": "Other",
     }
 
-    df["Resource"] = df[fuel_col].astype(str).str.upper().map(fuel_map)
-
-    if df["Resource"].isna().all():
-        df["Resource"] = df[fuel_col].astype(str).str.title()
-    else:
-        df["Resource"] = df["Resource"].fillna(df[fuel_col].astype(str).str.title())
+    df["Resource"] = df[fuel_col].map(fuel_map).fillna(df[fuel_col])
 
     monthly = (
         df.dropna(subset=["period", "generation"])
@@ -117,7 +109,6 @@ def get_eia_generation_mix():
     monthly["Total"] = monthly.groupby("period")["generation"].transform("sum")
     monthly = monthly[monthly["Total"] > 0]
     monthly["Share"] = monthly["generation"] / monthly["Total"] * 100
-    monthly["Month"] = monthly["period"].dt.strftime("%b %Y")
 
     return monthly
 
@@ -129,57 +120,40 @@ def get_ev_registration_share():
     except Exception:
         return None, None
 
-    all_sheets = []
-
+    dfs = []
     for sheet in xl.sheet_names:
         try:
             temp = pd.read_excel(xl, sheet_name=sheet)
-            temp["sheet_name"] = sheet
-            all_sheets.append(temp)
+            dfs.append(temp)
         except Exception:
             pass
 
-    if not all_sheets:
+    if not dfs:
         return None, None
 
-    df = pd.concat(all_sheets, ignore_index=True)
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    df = pd.concat(dfs, ignore_index=True)
+    df.columns = [str(c).lower() for c in df.columns]
 
-    text_cols = df.select_dtypes(include="object").columns.tolist()
-    number_cols = df.select_dtypes(include="number").columns.tolist()
+    text_cols = df.select_dtypes(include="object").columns
+    num_cols = df.select_dtypes(include="number").columns
 
-    if not text_cols or not number_cols:
+    if len(text_cols) == 0 or len(num_cols) == 0:
         return None, None
 
-    combined_text = df[text_cols].astype(str).agg(" ".join, axis=1).str.lower()
+    combined = df[text_cols].astype(str).agg(" ".join, axis=1).str.lower()
 
-    ev_mask = combined_text.str.contains(
-        r"electric|battery electric|plug.?in|phev|bev",
-        regex=True,
-        na=False,
-    )
+    ev_mask = combined.str.contains("electric|bev|phev", na=False)
+    ldv_mask = combined.str.contains("car|truck|suv|passenger", na=False)
 
-    ldv_mask = combined_text.str.contains(
-        r"passenger|auto|car|truck|light|suv",
-        regex=True,
-        na=False,
-    )
+    count_col = num_cols[-1]
 
-    count_col = number_cols[-1]
+    total = df.loc[ldv_mask, count_col].sum()
+    ev = df.loc[ev_mask & ldv_mask, count_col].sum()
 
-    total_ldv = df.loc[ldv_mask, count_col].sum()
-    ev_ldv = df.loc[ev_mask & ldv_mask, count_col].sum()
+    if total == 0:
+        return None, None
 
-    if total_ldv == 0:
-        total_all = df[count_col].sum()
-        ev_all = df.loc[ev_mask, count_col].sum()
-
-        if total_all == 0:
-            return None, None
-
-        return ev_all / total_all * 100, "all registrations, fallback estimate"
-
-    return ev_ldv / total_ldv * 100, "light-duty keyword estimate"
+    return ev / total * 100, "estimated from workbook"
 
 
 @st.cache_data(ttl=60 * 60 * 12)
@@ -191,81 +165,42 @@ def get_gsl_elevation():
         "sites": "10010000",
         "parameterCd": "62614",
         "startDT": "2015-01-01",
-        "siteStatus": "all",
     }
 
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
 
-    payload = r.json()
-    series = payload["value"]["timeSeries"][0]["values"][0]["value"]
+    series = r.json()["value"]["timeSeries"][0]["values"][0]["value"]
 
     df = pd.DataFrame(series)
-
-    if df.empty:
-        return df
-
-    df["date"] = pd.to_datetime(df["dateTime"], errors="coerce")
+    df["date"] = pd.to_datetime(df["dateTime"])
     df["elevation_ft"] = pd.to_numeric(df["value"], errors="coerce")
 
-    return df[["date", "elevation_ft"]].dropna()
+    return df.dropna()
 
+
+# ===========================
+# DASHBOARD
+# ===========================
 
 st.title("Beehive Emissions Reduction Plan Dashboard")
-st.caption("Internal prototype using live public data where available")
 
-gen = get_eia_generation_mix()
-ev_share, ev_note = get_ev_registration_share()
-
+# -------- ELECTRIC GENERATION --------
 st.header("Electric Generation")
 st.write(
     "BERP identified increasing zero emissions generation as a crucial strategy "
     "to reducing generation-related emissions."
 )
 
+gen = get_eia_generation_mix()
+
 if gen.empty:
-    st.warning(
-        "EIA generation data did not load. Check that your EIA_API_KEY is saved "
-        "in Streamlit secrets."
-    )
+    st.warning("EIA data unavailable. Check API key.")
 else:
-    latest_month = gen["period"].max()
-    latest = gen[gen["period"] == latest_month]
-
-    renewable_resources = ["Solar", "Wind", "Hydro", "Nuclear"]
-    fossil_resources = ["Coal", "Natural gas", "Petroleum"]
-
-    renewable_share = latest.loc[
-        latest["Resource"].isin(renewable_resources), "Share"
-    ].sum()
-
-    fossil_share = latest.loc[
-        latest["Resource"].isin(fossil_resources), "Share"
-    ].sum()
-
-    solar_share = latest.loc[latest["Resource"].eq("Solar"), "Share"].sum()
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Zero-emissions generation share", f"{renewable_share:.1f}%")
-    col2.metric("Fossil generation share", f"{fossil_share:.1f}%")
-    col3.metric("Solar generation share", f"{solar_share:.1f}%")
-
-    fig = px.area(
-        gen.sort_values("period"),
-        x="period",
-        y="Share",
-        color="Resource",
-        labels={
-            "period": "Month",
-            "Share": "Share of generation (%)",
-            "Resource": "Resource",
-        },
-    )
-
+    fig = px.area(gen, x="period", y="Share", color="Resource")
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"EIA latest month loaded: {latest_month.strftime('%B %Y')}")
 
+# -------- WORKING LANDS --------
 st.header("Working Lands")
 st.write(
     "BERP identified maintaining inflows to the Great Salt Lake as a critical "
@@ -273,90 +208,37 @@ st.write(
     "sequestration in the lakebed."
 )
 
-try:
-    gsl = get_gsl_elevation()
+gsl = get_gsl_elevation()
+fig = px.line(gsl, x="date", y="elevation_ft")
+st.plotly_chart(fig, use_container_width=True)
 
-    if gsl.empty:
-        st.warning("Great Salt Lake elevation data was returned but was empty.")
-    else:
-        fig_gsl = px.line(
-            gsl,
-            x="date",
-            y="elevation_ft",
-            labels={
-                "date": "Date",
-                "elevation_ft": "Elevation, feet above NGVD 1929",
-            },
-        )
-
-        st.plotly_chart(fig_gsl, use_container_width=True)
-
-        st.caption(
-            f"Latest Great Salt Lake elevation loaded: "
-            f"{gsl['elevation_ft'].iloc[-1]:,.2f} feet on "
-            f"{gsl['date'].iloc[-1].strftime('%B %d, %Y')}. "
-            "Source: USGS station 10010000."
-        )
-
-except Exception as e:
-    st.warning("Great Salt Lake elevation data could not be loaded.")
-    st.caption(str(e))
-
+# -------- TRANSPORTATION --------
 st.header("Transportation")
 st.write(
     "BERP identified increasing adoption of Zero Emissions Vehicles as a crucial "
     "strategy to reducing transportation-related emissions."
 )
 
-if ev_share is not None:
-    st.metric("Estimated EV registration share", f"{ev_share:.2f}%")
-    st.caption(f"Calculation note: {ev_note}")
-else:
-    st.warning(
-        "The Utah registration workbook loaded, but the app could not confidently "
-        "parse LDV electric registration share. We may need to inspect the workbook "
-        "tabs and column names, then hard-code the correct sheet and columns."
-    )
+ev, note = get_ev_registration_share()
 
+if ev:
+    st.metric("EV Share", f"{ev:.2f}%")
+else:
+    st.warning("Could not parse EV share")
+
+# -------- PROGRAMS --------
 st.header("Program Updates")
 
-charge_yard, industrial, renewable = st.columns(3)
+c1, c2, c3 = st.columns(3)
 
-with charge_yard:
-    st.info(
-        "**Charge Your Yard**\n\n"
-        "The Charge Your Yard program has removed **XXX fuel-based equipment units** "
-        "from use, reducing air quality emissions by **XXX per year**. Program staff "
-        "are continuing to track equipment retirements, rebate participation, and "
-        "estimated emissions benefits."
-    )
+with c1:
+    st.info("Charge Your Yard: XXX units removed, XXX emissions reduced")
 
-with industrial:
-    st.success(
-        "**Industrial Efficiency Improvements**\n\n"
-        "DAQ-supported industrial efficiency improvements are helping facilities reduce "
-        "fuel use, improve process controls, and lower emissions intensity. Recent "
-        "activities include identifying high-priority equipment upgrades, evaluating "
-        "cost-effective efficiency opportunities, and coordinating with facility staff "
-        "on implementation timelines."
-    )
+with c2:
+    st.success("Industrial efficiency improvements underway across sectors")
 
-with renewable:
+with c3:
     st.warning(
-        "**Utah Renewable Communities**\n\n"
-        "The Utah Renewable Communities program has received regulatory approval and "
-        "is now moving into implementation. Participating communities include:\n\n"
-        + ", ".join(PARTICIPATING_COMMUNITIES)
-        + ".\n\n"
-        "Together, these communities represent **XX% of statewide electricity demand**. "
-        "This placeholder should be replaced once the final demand-share calculation "
-        "has been reviewed."
+        "Utah Renewable Communities approved and under implementation. "
+        "Participants: " + ", ".join(PARTICIPATING_COMMUNITIES)
     )
-
-st.divider()
-
-st.caption(
-    "Sources: EIA electricity API for generation mix; Utah State Tax Commission "
-    "vehicle registration workbook for registration data; USGS daily values service "
-    "for Great Salt Lake elevation."
-)
